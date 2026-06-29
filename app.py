@@ -97,11 +97,26 @@ if "captured_image" not in st.session_state:
 left, right = st.columns([2, 1])
 
 with left:
+    camera_choice = st.radio(
+        "Camera", ["Back camera", "Front camera"], horizontal=True
+    )
+    facing_mode = "environment" if camera_choice == "Back camera" else "user"
+
+    # The key changes with facing_mode so switching the radio button forces
+    # a clean remount -> a fresh getUserMedia call with the new constraint,
+    # which is more reliable than hoping the browser hot-swaps the camera.
     ctx = webrtc_streamer(
-        key="barcode-scanner",
+        key=f"barcode-scanner-{facing_mode}",
         video_processor_factory=BarcodeProcessor,
         rtc_configuration=RTC_CONFIGURATION,
-        media_stream_constraints={"video": True, "audio": False},
+        media_stream_constraints={
+            "video": {
+                "facingMode": facing_mode,
+                "width": {"ideal": 1280},
+                "height": {"ideal": 720},
+            },
+            "audio": False,
+        },
     )
 
 with right:
