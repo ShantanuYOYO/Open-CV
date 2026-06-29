@@ -1,236 +1,248 @@
 """
-Live Barcode Scanner — Streamlit App
--------------------------------------
-- Opens your webcam right in the browser.
-- Every barcode (or QR code) visible in the live feed gets a green box +
-  label drawn around it in real time.
-- Once everything you want is nicely boxed, tap "Capture" to lock in that
-  frame. The decoded values are then listed next to the photo (type +
-  number), with a CSV download option.
+Barcode Scanner — Streamlit App  (Snapshot Camera Edition)
+----------------------------------------------------------
+KEY CHANGES vs the old version
+  ✓ Uses st.camera_input() — Streamlit's built-in camera snapshot.
+    No WebRTC, no streaming, no threading, no lag.
+  ✓ Photo is processed instantly on the server the moment it's taken.
+  ✓ Barcode numbers appear in prominent styled output boxes every time.
+  ✓ Green polygons + labels are drawn on the frozen captured photo.
+  ✓ Much simpler code — no BarcodeProcessor class, no locks needed.
+
+Requirements
+  pip install streamlit opencv-python-headless pyzbar numpy
+  Linux also needs: sudo apt-get install libzbar0
+  Mac:              brew install zbar
 """
 
-import threading
-import time
-
-import av
 import cv2
 import numpy as np
 import streamlit as st
 from pyzbar.pyzbar import decode
-from streamlit_webrtc import RTCConfiguration, VideoProcessorBase, webrtc_streamer
 
-st.set_page_config(page_title="Live Barcode Scanner", page_icon="📷", layout="wide")
-
-st.title("📷 Live Barcode Scanner")
-st.write(
-    "Point your camera at one or more barcodes. Every barcode found is "
-    "outlined with a **green box**. Once everything you want is boxed, "
-    "hit **Tap to capture**."
+# ── Page config ────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Barcode Scanner",
+    page_icon="📷",
+    layout="wide",
 )
 
-RTC_CONFIGURATION = RTCConfiguration(
-    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-)
-
-
-class BarcodeProcessor(VideoProcessorBase):
-    """Finds every barcode in each frame and draws a green box around it.
-
-    IMPORTANT: state lives on `self` (the processor instance), not on plain
-    module-level variables. Streamlit-webrtc keeps this exact instance alive
-    in the background across script reruns, so reading `ctx.video_processor`
-    later always points to the same live object the camera thread is
-    writing into. Plain globals would NOT work here, because Streamlit
-    re-executes the whole script (recreating any module-level variables)
-    every time you click a button — only `self.xxx` on this persisted
-    instance, or `st.session_state`, survive that.
-    """
-
-    def __init__(self) -> None:
-        self.lock = threading.Lock()
-        self.frame = None
-        self.barcodes = []
-
-    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        img = frame.to_ndarray(format="bgr24")
-        decoded_objects = decode(img)
-
-        detected = []
-        for obj in decoded_objects:
-            # The 4-point polygon hugs rotated/skewed barcodes better than
-            # the plain bounding rect, so prefer it when available.
-            if len(obj.polygon) == 4:
-                pts = np.array([(p.x, p.y) for p in obj.polygon], dtype=np.int32)
-            else:
-                x, y, w, h = obj.rect
-                pts = np.array(
-                    [(x, y), (x + w, y), (x + w, y + h), (x, y + h)], dtype=np.int32
-                )
-            pts = pts.reshape((-1, 1, 2))
-
-            # Green box around the barcode
-            cv2.polylines(img, [pts], isClosed=True, color=(0, 255, 0), thickness=3)
-
-            barcode_data = obj.data.decode("utf-8", errors="replace")
-            barcode_type = obj.type
-            label = f"{barcode_data} ({barcode_type})"
-
-            x, y, w, h = obj.rect
-            label_y = max(0, y - 25)
-            label_w = max(w, 9 * len(label))
-            cv2.rectangle(img, (x, label_y), (x + label_w, y), (0, 255, 0), -1)
-            cv2.putText(
-                img, label, (x + 2, y - 7),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA,
-            )
-
-            detected.append({"data": barcode_data, "type": barcode_type})
-
-        with self.lock:
-            self.frame = img.copy()
-            self.barcodes = detected
-
-        return av.VideoFrame.from_ndarray(img, format="bgr24")
-
-
-# ---------------------------------------------------------------------------
-# Session state for the captured (locked-in) results — this DOES persist
-# correctly across reruns since it's st.session_state, not a plain variable.
-# ---------------------------------------------------------------------------
-if "captured_barcodes" not in st.session_state:
-    st.session_state.captured_barcodes = []
-if "captured_image" not in st.session_state:
-    st.session_state.captured_image = None
-
-# Make the capture button feel like a camera shutter sitting right under
-# the live frame, rather than just another sidebar widget.
+# ── Global CSS ─────────────────────────────────────────────────────────────
 st.markdown(
     """
     <style>
-    div[data-testid="stButton"] > button[kind="primary"] {
-        font-size: 1.15rem;
+    /* Page heading */
+    .app-title {
+        font-size: 2rem;
+        font-weight: 800;
+        color: #1b5e20;
+        margin-bottom: 0.15rem;
+    }
+
+    /* Individual barcode result card */
+    .bc-card {
+        background: linear-gradient(135deg, #e8f5e9 0%, #f9fbe7 100%);
+        border-left: 6px solid #43a047;
+        border-radius: 10px;
+        padding: 14px 20px;
+        margin-bottom: 12px;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.07);
+    }
+    .bc-number {
+        font-family: "Courier New", Courier, monospace;
+        font-size: 1.35rem;
+        font-weight: 800;
+        color: #1b5e20;
+        letter-spacing: 0.04em;
+        word-break: break-all;
+    }
+    .bc-badge {
+        display: inline-block;
+        background: #43a047;
+        color: #fff;
+        font-size: 0.72rem;
+        font-weight: 700;
+        border-radius: 20px;
+        padding: 2px 10px;
+        margin-top: 6px;
+        letter-spacing: 0.05em;
+    }
+    .bc-index {
+        font-size: 0.78rem;
+        color: #888;
+        margin-bottom: 3px;
+    }
+
+    /* Warning card — no barcode detected */
+    .no-bc {
+        background: #fff8e1;
+        border-left: 6px solid #ffa000;
+        border-radius: 10px;
+        padding: 14px 20px;
+        color: #e65100;
         font-weight: 600;
-        padding: 0.7rem 0;
-        border-radius: 12px;
+        font-size: 1rem;
     }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-camera_choice = st.radio("Camera", ["Back camera", "Front camera"], horizontal=True)
-facing_mode = "environment" if camera_choice == "Back camera" else "user"
 
-# The key changes with facing_mode so switching the radio button forces a
-# clean remount -> a fresh getUserMedia call with the new constraint, which
-# is more reliable than hoping the browser hot-swaps the camera.
-ctx = webrtc_streamer(
-    key=f"barcode-scanner-{facing_mode}",
-    video_processor_factory=BarcodeProcessor,
-    rtc_configuration=RTC_CONFIGURATION,
-    media_stream_constraints={
-        "video": {
-            "facingMode": facing_mode,
-            "width": {"ideal": 1280},
-            "height": {"ideal": 720},
-        },
-        "audio": False,
-    },
+# ── Core detection function ────────────────────────────────────────────────
+def detect_and_annotate(img_bgr: np.ndarray):
+    """
+    Run pyzbar on *img_bgr*, draw green polygons + labels for every barcode
+    found, and return (annotated_copy, list_of_dicts).
+
+    Each dict has keys 'data' (str) and 'type' (str).
+    """
+    out = img_bgr.copy()
+    found = []
+
+    for obj in decode(img_bgr):
+        data = obj.data.decode("utf-8", errors="replace")
+        kind = obj.type
+        found.append({"data": data, "type": kind})
+
+        # ── Polygon around barcode ─────────────────────────────────────────
+        if len(obj.polygon) == 4:
+            pts = np.array([(p.x, p.y) for p in obj.polygon], np.int32)
+        else:
+            x, y, w, h = obj.rect
+            pts = np.array(
+                [(x, y), (x + w, y), (x + w, y + h), (x, y + h)], np.int32
+            )
+        cv2.polylines(out, [pts.reshape(-1, 1, 2)], True, (0, 220, 0), 4)
+
+        # ── Label: measure text first so the background box fits exactly ──
+        label = f"{data}  [{kind}]"
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        fscale = 0.60
+        fthick = 2
+        (tw, th), bl = cv2.getTextSize(label, font, fscale, fthick)
+
+        x, y, w, h = obj.rect
+        # Place label above the barcode; clamp so it never goes off the top
+        pad = 6
+        lx = x
+        ly = max(y - pad, th + bl + pad * 2)  # y of the text baseline
+
+        # Green pill behind text
+        cv2.rectangle(
+            out,
+            (lx - 2, ly - th - bl - pad),
+            (lx + tw + pad * 2, ly + pad // 2),
+            (0, 200, 0),
+            -1,
+        )
+        # Black text on top
+        cv2.putText(
+            out,
+            label,
+            (lx + pad, ly - bl),
+            font,
+            fscale,
+            (0, 0, 0),
+            fthick,
+            cv2.LINE_AA,
+        )
+
+    return out, found
+
+
+# ── UI ─────────────────────────────────────────────────────────────────────
+st.markdown('<p class="app-title">📷 Barcode Scanner</p>', unsafe_allow_html=True)
+st.write(
+    "Position a barcode in the camera view below, then press **Take photo**. "
+    "All barcodes found are highlighted with a **green box** and their numbers "
+    "are shown immediately on the right."
 )
 
-# Shutter button sits directly under the live frame — tap it once every
-# barcode you want is boxed in green.
-btn_col, reset_col = st.columns([4, 1])
-with btn_col:
-    capture_clicked = st.button(
-        "📸  Tap to capture", use_container_width=True, type="primary"
-    )
-with reset_col:
-    reset_clicked = st.button("🔄 Reset", use_container_width=True)
-
-status_box = st.empty()
-
-if reset_clicked:
-    st.session_state.captured_barcodes = []
-    st.session_state.captured_image = None
-
-if capture_clicked:
-    processor = ctx.video_processor
-    if processor is None:
-        st.warning(
-            "Camera isn't connected yet — wait for the live preview to "
-            "appear, then try capturing again."
-        )
-    else:
-        with processor.lock:
-            current_barcodes = list(processor.barcodes)
-            current_frame = (
-                processor.frame.copy() if processor.frame is not None else None
-            )
-        if not current_barcodes:
-            st.warning(
-                "No barcode is in view right now — hold steady over a "
-                "barcode until it's boxed in green, then try again."
-            )
-        else:
-            st.session_state.captured_barcodes = current_barcodes
-            st.session_state.captured_image = current_frame
-            st.success(f"Captured {len(current_barcodes)} barcode(s)!")
+st.info(
+    "💡 **Tip:** Hold your camera steady and make sure the barcode is well-lit "
+    "and fills at least ¼ of the frame for best results.",
+    icon=None,
+)
 
 st.divider()
 
-# Captured photo and its barcode list, shown side by side.
-if st.session_state.captured_image is not None or st.session_state.captured_barcodes:
-    img_col, list_col = st.columns([1, 1])
+# st.camera_input shows a live camera preview (no streaming lag) and returns
+# the snapshot as bytes the moment the shutter button is tapped.
+photo = st.camera_input(
+    label="Camera  •  press **Take photo** when the barcode is centred",
+    key="camera",
+)
 
-    with img_col:
-        st.subheader("📌 Captured frame")
-        if st.session_state.captured_image is not None:
+if photo is not None:
+    # ── Decode bytes → OpenCV BGR array ───────────────────────────────────
+    raw = np.frombuffer(photo.getvalue(), dtype=np.uint8)
+    img_bgr = cv2.imdecode(raw, cv2.IMREAD_COLOR)
+
+    if img_bgr is None:
+        st.error("Could not read the photo — please try again.")
+    else:
+        annotated, barcodes = detect_and_annotate(img_bgr)
+
+        st.divider()
+        img_col, result_col = st.columns([3, 2], gap="large")
+
+        # ── Left: annotated photo ──────────────────────────────────────────
+        with img_col:
+            st.subheader("📌 Captured photo")
             st.image(
-                cv2.cvtColor(st.session_state.captured_image, cv2.COLOR_BGR2RGB),
-                channels="RGB",
+                cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB),
                 use_container_width=True,
             )
 
-    with list_col:
-        st.subheader("✅ Barcode numbers")
-        if st.session_state.captured_barcodes:
-            rows = [
-                {"No.": i + 1, "Type": b["type"], "Barcode Number": b["data"]}
-                for i, b in enumerate(st.session_state.captured_barcodes)
-            ]
-            st.table(rows)
+        # ── Right: barcode numbers ─────────────────────────────────────────
+        with result_col:
+            st.subheader("🔢 Barcode numbers")
 
-            csv_lines = ["No.,Type,Barcode Number"] + [
-                f'{r["No."]},{r["Type"]},{r["Barcode Number"]}' for r in rows
-            ]
-            st.download_button(
-                "⬇️ Download as CSV",
-                data="\n".join(csv_lines),
-                file_name="barcodes.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
+            if barcodes:
+                for i, bc in enumerate(barcodes, start=1):
+                    st.markdown(
+                        f"""
+                        <div class="bc-card">
+                            <div class="bc-index">Barcode #{i}</div>
+                            <div class="bc-number">{bc['data']}</div>
+                            <span class="bc-badge">{bc['type']}</span>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
 
-# ---------------------------------------------------------------------------
-# Live-updating status (must stay the LAST thing in the script). While the
-# camera is streaming, this loop keeps refreshing the "barcodes currently
-# in view" indicator by reading straight from the persisted processor
-# instance. Any button click / stream stop triggers a Streamlit rerun,
-# which naturally breaks out of this loop and re-executes everything above
-# with the freshly updated state.
-# ---------------------------------------------------------------------------
-if ctx.state.playing:
-    while True:
-        processor = ctx.video_processor
-        if processor is not None:
-            with processor.lock:
-                count = len(processor.barcodes)
-                values = [b["data"] for b in processor.barcodes]
-            if count > 0:
-                status_box.success(
-                    f"✅ {count} barcode(s) in view:\n" + "\n".join(values)
+                st.divider()
+
+                # ── Table view ─────────────────────────────────────────────
+                rows = [
+                    {"#": i, "Type": bc["type"], "Barcode Number": bc["data"]}
+                    for i, bc in enumerate(barcodes, 1)
+                ]
+                st.table(rows)
+
+                # ── CSV download ───────────────────────────────────────────
+                csv_lines = ["No.,Type,Barcode Number"] + [
+                    f"{r['#']},{r['Type']},{r['Barcode Number']}" for r in rows
+                ]
+                st.download_button(
+                    label="⬇️  Download as CSV",
+                    data="\n".join(csv_lines),
+                    file_name="barcodes.csv",
+                    mime="text/csv",
+                    use_container_width=True,
                 )
+
             else:
-                status_box.info("🔍 Scanning… no barcode in view yet")
-        time.sleep(0.3)
+                st.markdown(
+                    """
+                    <div class="no-bc">
+                        ⚠️ No barcode detected in this photo.<br><br>
+                        <b>Try:</b><br>
+                        • Better lighting (avoid glare)<br>
+                        • Move closer to the barcode<br>
+                        • Hold the camera still before tapping
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
