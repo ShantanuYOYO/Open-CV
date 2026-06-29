@@ -4,9 +4,9 @@ Live Barcode Scanner — Streamlit App
 - Opens your webcam right in the browser.
 - Every barcode (or QR code) visible in the live feed gets a green box +
   label drawn around it in real time.
-- Once everything you want is nicely boxed, click "Capture Photo" to lock
-  in that frame. The decoded values are then listed in a table below
-  (type + number), with a CSV download option.
+- Once everything you want is nicely boxed, tap "Capture" to lock in that
+  frame. The decoded values are then listed next to the photo (type +
+  number), with a CSV download option.
 """
 
 import threading
@@ -25,16 +25,8 @@ st.title("📷 Live Barcode Scanner")
 st.write(
     "Point your camera at one or more barcodes. Every barcode found is "
     "outlined with a **green box**. Once everything you want is boxed, "
-    "hit **Capture Photo**."
+    "hit **Tap to capture**."
 )
-
-# ---------------------------------------------------------------------------
-# Shared state between the video-processing thread (recv, runs continuously
-# in the background) and the main Streamlit thread. Protected by a lock
-# since both can read/write at the same time.
-# ---------------------------------------------------------------------------
-lock = threading.Lock()
-shared_state = {"frame": None, "barcodes": []}
 
 RTC_CONFIGURATION = RTCConfiguration(
     {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
@@ -42,7 +34,22 @@ RTC_CONFIGURATION = RTCConfiguration(
 
 
 class BarcodeProcessor(VideoProcessorBase):
-    """Finds every barcode in each frame and draws a green box around it."""
+    """Finds every barcode in each frame and draws a green box around it.
+
+    IMPORTANT: state lives on `self` (the processor instance), not on plain
+    module-level variables. Streamlit-webrtc keeps this exact instance alive
+    in the background across script reruns, so reading `ctx.video_processor`
+    later always points to the same live object the camera thread is
+    writing into. Plain globals would NOT work here, because Streamlit
+    re-executes the whole script (recreating any module-level variables)
+    every time you click a button — only `self.xxx` on this persisted
+    instance, or `st.session_state`, survive that.
+    """
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.frame = None
+        self.barcodes = []
 
     def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
         img = frame.to_ndarray(format="bgr24")
@@ -79,15 +86,16 @@ class BarcodeProcessor(VideoProcessorBase):
 
             detected.append({"data": barcode_data, "type": barcode_type})
 
-        with lock:
-            shared_state["frame"] = img.copy()
-            shared_state["barcodes"] = detected
+        with self.lock:
+            self.frame = img.copy()
+            self.barcodes = detected
 
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 
 # ---------------------------------------------------------------------------
-# Session state for the captured (locked-in) results
+# Session state for the captured (locked-in) results — this DOES persist
+# correctly across reruns since it's st.session_state, not a plain variable.
 # ---------------------------------------------------------------------------
 if "captured_barcodes" not in st.session_state:
     st.session_state.captured_barcodes = []
@@ -147,20 +155,27 @@ if reset_clicked:
     st.session_state.captured_image = None
 
 if capture_clicked:
-    with lock:
-        current_barcodes = list(shared_state["barcodes"])
-        current_frame = (
-            shared_state["frame"].copy() if shared_state["frame"] is not None else None
-        )
-    if not current_barcodes:
+    processor = ctx.video_processor
+    if processor is None:
         st.warning(
-            "No barcode is in view right now — hold steady over a barcode "
-            "until it's boxed in green, then try again."
+            "Camera isn't connected yet — wait for the live preview to "
+            "appear, then try capturing again."
         )
     else:
-        st.session_state.captured_barcodes = current_barcodes
-        st.session_state.captured_image = current_frame
-        st.success(f"Captured {len(current_barcodes)} barcode(s)!")
+        with processor.lock:
+            current_barcodes = list(processor.barcodes)
+            current_frame = (
+                processor.frame.copy() if processor.frame is not None else None
+            )
+        if not current_barcodes:
+            st.warning(
+                "No barcode is in view right now — hold steady over a "
+                "barcode until it's boxed in green, then try again."
+            )
+        else:
+            st.session_state.captured_barcodes = current_barcodes
+            st.session_state.captured_image = current_frame
+            st.success(f"Captured {len(current_barcodes)} barcode(s)!")
 
 st.divider()
 
@@ -200,17 +215,22 @@ if st.session_state.captured_image is not None or st.session_state.captured_barc
 # ---------------------------------------------------------------------------
 # Live-updating status (must stay the LAST thing in the script). While the
 # camera is streaming, this loop keeps refreshing the "barcodes currently
-# in view" indicator. Any button click / stream stop triggers a Streamlit
-# rerun, which naturally breaks out of this loop and re-executes everything
-# above with the freshly updated state.
+# in view" indicator by reading straight from the persisted processor
+# instance. Any button click / stream stop triggers a Streamlit rerun,
+# which naturally breaks out of this loop and re-executes everything above
+# with the freshly updated state.
 # ---------------------------------------------------------------------------
 if ctx.state.playing:
     while True:
-        with lock:
-            count = len(shared_state["barcodes"])
-            values = [b["data"] for b in shared_state["barcodes"]]
-        if count > 0:
-            status_box.success(f"✅ {count} barcode(s) in view:\n" + "\n".join(values))
-        else:
-            status_box.info("🔍 Scanning… no barcode in view yet")
+        processor = ctx.video_processor
+        if processor is not None:
+            with processor.lock:
+                count = len(processor.barcodes)
+                values = [b["data"] for b in processor.barcodes]
+            if count > 0:
+                status_box.success(
+                    f"✅ {count} barcode(s) in view:\n" + "\n".join(values)
+                )
+            else:
+                status_box.info("🔍 Scanning… no barcode in view yet")
         time.sleep(0.3)
