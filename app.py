@@ -94,40 +94,53 @@ if "captured_barcodes" not in st.session_state:
 if "captured_image" not in st.session_state:
     st.session_state.captured_image = None
 
-left, right = st.columns([2, 1])
+# Make the capture button feel like a camera shutter sitting right under
+# the live frame, rather than just another sidebar widget.
+st.markdown(
+    """
+    <style>
+    div[data-testid="stButton"] > button[kind="primary"] {
+        font-size: 1.15rem;
+        font-weight: 600;
+        padding: 0.7rem 0;
+        border-radius: 12px;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-with left:
-    camera_choice = st.radio(
-        "Camera", ["Back camera", "Front camera"], horizontal=True
-    )
-    facing_mode = "environment" if camera_choice == "Back camera" else "user"
+camera_choice = st.radio("Camera", ["Back camera", "Front camera"], horizontal=True)
+facing_mode = "environment" if camera_choice == "Back camera" else "user"
 
-    # The key changes with facing_mode so switching the radio button forces
-    # a clean remount -> a fresh getUserMedia call with the new constraint,
-    # which is more reliable than hoping the browser hot-swaps the camera.
-    ctx = webrtc_streamer(
-        key=f"barcode-scanner-{facing_mode}",
-        video_processor_factory=BarcodeProcessor,
-        rtc_configuration=RTC_CONFIGURATION,
-        media_stream_constraints={
-            "video": {
-                "facingMode": facing_mode,
-                "width": {"ideal": 1280},
-                "height": {"ideal": 720},
-            },
-            "audio": False,
+# The key changes with facing_mode so switching the radio button forces a
+# clean remount -> a fresh getUserMedia call with the new constraint, which
+# is more reliable than hoping the browser hot-swaps the camera.
+ctx = webrtc_streamer(
+    key=f"barcode-scanner-{facing_mode}",
+    video_processor_factory=BarcodeProcessor,
+    rtc_configuration=RTC_CONFIGURATION,
+    media_stream_constraints={
+        "video": {
+            "facingMode": facing_mode,
+            "width": {"ideal": 1280},
+            "height": {"ideal": 720},
         },
-    )
+        "audio": False,
+    },
+)
 
-with right:
-    st.subheader("Controls")
+# Shutter button sits directly under the live frame — tap it once every
+# barcode you want is boxed in green.
+btn_col, reset_col = st.columns([4, 1])
+with btn_col:
     capture_clicked = st.button(
-        "📸 Capture Photo", use_container_width=True, type="primary"
+        "📸  Tap to capture", use_container_width=True, type="primary"
     )
-    reset_clicked = st.button("🔄 Scan again", use_container_width=True)
-    st.divider()
-    st.caption("Live status")
-    status_box = st.empty()
+with reset_col:
+    reset_clicked = st.button("🔄 Reset", use_container_width=True)
+
+status_box = st.empty()
 
 if reset_clicked:
     st.session_state.captured_barcodes = []
@@ -151,32 +164,38 @@ if capture_clicked:
 
 st.divider()
 
-if st.session_state.captured_image is not None:
-    st.subheader("📌 Captured frame")
-    st.image(
-        cv2.cvtColor(st.session_state.captured_image, cv2.COLOR_BGR2RGB),
-        channels="RGB",
-        use_container_width=True,
-    )
+# Captured photo and its barcode list, shown side by side.
+if st.session_state.captured_image is not None or st.session_state.captured_barcodes:
+    img_col, list_col = st.columns([1, 1])
 
-if st.session_state.captured_barcodes:
-    st.subheader("✅ Barcode numbers")
-    rows = [
-        {"No.": i + 1, "Type": b["type"], "Barcode Number": b["data"]}
-        for i, b in enumerate(st.session_state.captured_barcodes)
-    ]
-    st.table(rows)
+    with img_col:
+        st.subheader("📌 Captured frame")
+        if st.session_state.captured_image is not None:
+            st.image(
+                cv2.cvtColor(st.session_state.captured_image, cv2.COLOR_BGR2RGB),
+                channels="RGB",
+                use_container_width=True,
+            )
 
-    csv_lines = ["No.,Type,Barcode Number"] + [
-        f'{r["No."]},{r["Type"]},{r["Barcode Number"]}' for r in rows
-    ]
-    st.download_button(
-        "⬇️ Download as CSV",
-        data="\n".join(csv_lines),
-        file_name="barcodes.csv",
-        mime="text/csv",
-        use_container_width=True,
-    )
+    with list_col:
+        st.subheader("✅ Barcode numbers")
+        if st.session_state.captured_barcodes:
+            rows = [
+                {"No.": i + 1, "Type": b["type"], "Barcode Number": b["data"]}
+                for i, b in enumerate(st.session_state.captured_barcodes)
+            ]
+            st.table(rows)
+
+            csv_lines = ["No.,Type,Barcode Number"] + [
+                f'{r["No."]},{r["Type"]},{r["Barcode Number"]}' for r in rows
+            ]
+            st.download_button(
+                "⬇️ Download as CSV",
+                data="\n".join(csv_lines),
+                file_name="barcodes.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
 
 # ---------------------------------------------------------------------------
 # Live-updating status (must stay the LAST thing in the script). While the
